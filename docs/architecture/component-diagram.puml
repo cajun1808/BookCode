@@ -1,0 +1,119 @@
+@startuml component-diagram
+' BookCode — component diagram.
+' IDs like (D12) or (P11) refer to the decision log in docs/architecture/README.md.
+
+title BookCode — component diagram
+
+left to right direction
+skinparam shadowing false
+skinparam componentStyle uml2
+skinparam nodesep 40
+skinparam ranksep 90
+skinparam wrapWidth 220
+skinparam defaultTextAlignment center
+
+actor "User / Admin" as person
+
+package "Browser" {
+  component "React SPA (TypeScript)" as spa {
+    component "Pages\n--\nsign up / sign in\ncatalogue & book pages (incl. work in progress)\nupload & approval\nquestion workspace (editor, run, report)\nadmin console" as pages
+    component "Draft store" as drafts
+    component "API client\n(fetch + EventSource)" as apiClient
+  }
+  database "localStorage\n(code drafts, 24 h)" as ls
+}
+
+component "Express API (TypeScript, single process — D12)" as api {
+  component "Routes\n+ session middleware\n+ role guard" as routes
+
+  package "Services" as services {
+    component "AuthService" as authSvc
+    component "CatalogueService" as catSvc
+    component "IngestionService\n(upload, approval,\nedition lock)" as ingSvc
+    component "ExecutionService\n(assemble source,\ncompare outputs)" as execSvc
+    component "ReportService" as repSvc
+    component "AdminService" as admSvc
+  }
+
+  package "In-process background work" as bg {
+    component "IngestionRunner\n(one job per upload)" as runner
+    component "ProgressEventBus\n+ SSE endpoint (P14)" as bus
+    component "Start-up & sweeper tasks\n(seed admin D2,\nfail orphaned jobs P4,\nexpire unapproved jobs D9)" as tasks
+  }
+
+  package "Adapters" as adapters {
+    component "Repositories" as repo
+    component "PdfSplitter" as pdf
+    interface "LlmClient" as llmI
+    interface "CodeRunner" as runI
+    component "Judge0Client" as j0C
+    component "GeminiClient" as gemC
+  }
+}
+
+database "MongoDB" as mongo
+folder "Temporary PDF storage\n(API host's local disk)" as disk
+cloud "Google Gemini API\n(free tier — D17)" as gemini
+
+node "VPS — Ubuntu 24.04 booted with cgroup v1 (D30)" as vps {
+  component "Judge0 CE — custom image\n(current Python, Java, Node.js)" as judge0 {
+    component "Judge0 API server" as j0api
+    component "Workers\n(isolate sandbox)" as j0w
+    database "PostgreSQL" as j0pg
+    database "Redis (queue)" as j0redis
+  }
+}
+
+' --- browser side
+person --> pages : uses
+pages --> drafts
+drafts --> ls : "{code, savedAt}"
+pages --> apiClient
+
+' --- browser <-> API
+apiClient --> routes : "REST/JSON over HTTPS\n(httpOnly session cookie — D4, P16)"
+bus .[norank].> apiClient : "Server-Sent Events\n(ingestion progress — D15)"
+
+' --- inside the API
+routes --> services
+routes .[norank].> bus : "subscribe\n(SSE requests)"
+ingSvc --> runner : "start job"
+runner --> bus : "publish progress"
+runner --> pdf : "cut out pages"
+runner ..> llmI : "use"
+execSvc ..> runI : "use"
+llmI -- gemC
+runI -- j0C
+services --> repo
+runner --> repo
+tasks --> repo
+routes -[norank]-> repo : "session store"
+
+' --- API to its dependencies
+repo --> mongo
+ingSvc --> disk : "save / delete PDF"
+runner --> disk : "read / delete PDF"
+tasks --> disk : "delete expired PDFs"
+gemC --> gemini : "HTTPS\n(PDF pages in, JSON out)"
+j0C --> j0api : "HTTP POST /submissions?wait=true\n(P10)"
+
+' --- inside Judge0
+j0api --> j0redis
+j0api --> j0pg
+j0w --> j0redis
+j0w --> j0pg
+
+note bottom of mongo
+  Collections: users, sessions, books, editions,
+  chapters, questions (test cases embedded),
+  completions, reports, ingestionJobs.
+  See class-diagram.puml.
+end note
+
+legend bottom left
+  IDs in brackets (D12, P11, O3 …) refer to the decision log in docs/architecture/README.md.
+  The LlmClient and CodeRunner interfaces let Gemini or Judge0 be replaced without touching the services (P11).
+  Where the Express API and MongoDB are hosted is not decided yet (O3).
+endlegend
+
+@enduml

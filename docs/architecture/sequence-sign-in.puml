@@ -1,0 +1,91 @@
+@startuml sequence-sign-in
+' BookCode — sign in, and how later requests are authenticated.
+' IDs like (D2) or (P16) refer to the decision log in docs/architecture/README.md.
+
+title Sign in (and how later requests are authenticated)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+autonumber
+
+actor "User or Admin" as u
+participant "React SPA" as spa
+participant "Express API\n(AuthService +\nsession middleware)" as api
+database "MongoDB" as db
+
+== API start-up (once per process) ==
+api -> db : find User with email = ADMIN_EMAIL
+alt no such user
+  api -> api : hash ADMIN_PASSWORD
+  api -> db : insert User {email: ADMIN_EMAIL, role: ADMIN}
+end
+note over api, db
+  D2: the admin account comes from environment variables.
+  In v1 there is no other way to get the ADMIN role.
+end note
+
+== Sign in ==
+u -> spa : enter email + password
+spa -> api : POST /api/auth/signin {email, password}
+activate api
+api -> db : find User by email
+alt user exists and password matches its hash
+  api -> api : generate a new session id\n(never reuse one from before sign-in)
+  api -> db : insert Session {userId, expiresAt}
+  api --> spa : 200 {id, email, role}\nSet-Cookie: sid=…; HttpOnly; Secure; SameSite=Lax  (D4, P16)
+  alt role = ADMIN
+    spa --> u : catalogue + admin console
+  else role = USER
+    spa --> u : catalogue
+  end
+else no such user, or wrong password
+  api --> spa : 401 "Invalid email or password"
+  note right
+    Same message in both cases, so the
+    response doesn't reveal which emails exist.
+  end note
+  spa --> u : error message
+end
+deactivate api
+
+== Page load or refresh ==
+note over spa
+  JavaScript can't read an httpOnly cookie,
+  so the SPA asks the API who is signed in.
+end note
+spa -> api : GET /api/auth/me\n(browser sends the cookie)
+activate api
+api -> db : find Session by id (not expired), then its User
+alt valid session
+  api --> spa : 200 {id, email, role}
+else missing or expired
+  api --> spa : 401
+  spa --> u : sign-in page
+end
+deactivate api
+
+== Every other API request ==
+spa -> api : request (+ cookie)
+activate api
+api -> db : load Session → User (role)
+alt no valid session
+  api --> spa : 401
+else route is admin-only and role ≠ ADMIN
+  api --> spa : 403
+else allowed
+  api -> api : handle the request
+  api --> spa : response
+end
+deactivate api
+
+== Sign out ==
+u -> spa : sign out
+spa -> api : POST /api/auth/signout
+activate api
+api -> db : delete Session
+api --> spa : 204 (cookie cleared)
+deactivate api
+spa --> u : sign-in page
+
+@enduml

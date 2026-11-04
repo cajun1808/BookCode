@@ -1,0 +1,87 @@
+@startuml sequence-attempt-question
+' BookCode — attempting a question.
+' IDs like (D28) or (P9) refer to the decision log in docs/architecture/README.md.
+
+title Attempting a question
+
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 260
+autonumber
+
+actor "User" as u
+participant "React SPA\n(question workspace)" as spa
+database "localStorage" as ls
+participant "Express API\n(ExecutionService)" as api
+database "MongoDB" as db
+participant "Judge0 CE\n(self-hosted, D30)" as j0
+
+== Open the question ==
+u -> spa : open a question
+spa -> api : GET /api/questions/{id}
+activate api
+api -> db : load Question + its Edition
+alt edition not READY (D16)
+  api --> spa : 404
+else
+  api -> db : find Completion {userId, questionId}
+  api --> spa : statement, language + version, starter code,\nvisible tests (arguments, expected), completed?
+  note right
+    Hidden tests and the harness
+    never leave the server.
+  end note
+end
+deactivate api
+spa -> ls : delete drafts older than 24 h (P8)
+spa -> ls : read draft {userId, questionId}
+alt draft found
+  ls --> spa : {code, savedAt}
+else no draft
+  spa -> spa : use the starter code
+end
+spa --> u : statement, editor locked to the question's\nlanguage (D22), visible tests
+
+== Edit ==
+loop while typing
+  u -> spa : edit code
+  spa -> ls : save {code, savedAt}  (debounced, D29)
+end
+
+== Run (D27, D28) ==
+u -> spa : Run
+spa -> api : POST /api/questions/{id}/run {code}
+activate api
+api -> db : load harness, all test cases, language + version
+api -> api : find Judge0 language id (SupportedRuntime)
+api -> api : source = user code + harness, one file\n(Java: user's Solution + harness Main) (P9)
+api -> api : stdin = every test's arguments as JSON\n(no expected outputs, D28)
+api -> j0 : POST /submissions?wait=true\n{language_id, source_code, stdin,\ncpu_time_limit, memory_limit} (P10, O6)
+alt Judge0 unreachable or the request times out
+  api --> spa : 503
+  spa --> u : "The code runner is unavailable, try again"
+else Judge0 responds
+  j0 --> api : {status, stdout, stderr, compile_output, time, memory}
+  alt compilation error
+    api --> spa : RunResult COMPILATION_ERROR + compiler output
+    spa --> u : compiler output
+  else program ran
+    api -> api : split stdout into marked result lines (P9)\nand the user's own output
+    api -> api : compare each result with its expected output in test order:\nexact value and type (D25); unordered if orderInsensitive (D26)
+    alt every test matches
+      api -> db : upsert Completion {userId, questionId} (A6)
+      api --> spa : RunResult PASSED
+      spa -> ls : delete draft (D29)
+      spa --> u : "All tests passed" — question marked complete
+    else first failing test i returned a wrong value
+      api --> spa : RunResult WRONG_ANSWER\n+ test i (arguments, expected, actual, visible?) + stdout
+      spa --> u : the failing test, shown even if hidden (D24)
+    else first failing test i has no result line (time limit or crash)\nor the harness reported an exception for it
+      api --> spa : RunResult TIME_LIMIT_EXCEEDED or RUNTIME_ERROR\n+ test i + stderr (P15)
+      spa --> u : the test that was running + the error
+    end
+  end
+end
+deactivate api
+
+@enduml

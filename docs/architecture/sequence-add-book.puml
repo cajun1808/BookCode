@@ -1,0 +1,170 @@
+@startuml sequence-add-book
+' BookCode — adding a book (uploading a PDF).
+' IDs like (D13) or (P7) refer to the decision log in docs/architecture/README.md.
+
+title Adding a book (upload → approval → processing)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 260
+autonumber
+
+actor "Uploader" as up
+participant "React SPA" as spa
+participant "Express API\n(IngestionService)" as api
+participant "IngestionRunner\n(in-process, D12)" as runner
+participant "ProgressEventBus\n(in-process, P14)" as bus
+database "Temp PDF storage\n(local disk)" as disk
+database "MongoDB" as db
+participant "Gemini API\n(free tier, D17)" as gem
+
+== 1. Upload ==
+up -> spa : choose a PDF, click Upload
+spa -> api : POST /api/ingestion-jobs\n(multipart: PDF)
+activate api
+api -> api : check it is a PDF; size limit (O4)
+api -> disk : save PDF
+api -> db : insert IngestionJob {status: DETECTING, uploaderId,\npdfPath, approvalDeadline: now + 24 h (D9)}
+api ->> runner : detectMetadata(jobId)  [not awaited]
+api --> spa : 202 Accepted {jobId}
+deactivate api
+spa -> spa : go to /upload/{jobId}  (P2: a refresh returns here)
+spa -> api : GET /api/ingestion-jobs/{jobId}/events  (SSE)
+api -> bus : subscribe(jobId)
+note right of api
+  On subscribe the API first sends the job's current state,
+  so an event published before the browser connected isn't missed.
+  Before approval only the uploader may subscribe;
+  while PROCESSING any signed-in user may (P6).
+end note
+
+== 2. Detect title, authors and edition ==
+activate runner
+runner -> disk : read PDF
+runner -> runner : cut out the first 15 pages (P7)
+runner -> gem : generateContent(pages, "title, subtitle,\nauthors, edition number → JSON")
+alt Gemini error
+  gem --> runner : error
+  runner -> db : job → FAILED (reason)
+  runner -> disk : delete PDF
+  runner -> bus : publish(failed)
+  bus --> spa : event: failed
+  spa --> up : "We couldn't read this PDF"
+else Gemini responds
+  gem --> runner : {mainTitle, fullTitle, authors, editionNumber}\n(any field may be missing — the uploader fills it in, P2)
+  runner -> db : job → AWAITING_APPROVAL, detected = metadata
+  runner -> bus : publish(metadataDetected)
+  bus --> spa : event: metadataDetected
+  spa --> up : approval form, pre-filled
+end
+deactivate runner
+
+== 3. Approve (D8) ==
+alt uploader cancels (P2)
+  up -> spa : Cancel
+  spa -> api : POST /api/ingestion-jobs/{jobId}/cancel
+  api -> db : job → CANCELLED
+  api -> disk : delete PDF
+else uploader approves, after correcting any field (P2)
+  up -> spa : Approve
+  spa -> api : POST /api/ingestion-jobs/{jobId}/approve\n{mainTitle, fullTitle, authors, editionNumber}
+  activate api
+  api -> db : check job: belongs to this user,\nAWAITING_APPROVAL, before its deadline
+  api -> api : normalise → matchKey (D7)
+  api -> db : upsert Book by matchKey
+  api -> db : atomic claim of Edition {bookId, editionNumber} (P3):\nset PROCESSING + lock {jobId, heartbeatAt: now}\nonly if it doesn't exist, is FAILED,\nor its lock is older than 10 min (D13, P4)
+  alt edition is READY (D6)
+    api -> db : job → REJECTED ("already processed")
+    api -> disk : delete PDF
+    api --> spa : 409 {editionId}
+    spa --> up : "This edition is already on BookCode" + link
+  else edition is PROCESSING with a fresh lock (D14)
+    api -> db : job → REJECTED ("being processed")
+    api -> disk : delete PDF
+    api --> spa : 409
+    spa --> up : "Someone is already processing this edition"
+  else claimed
+    api -> db : delete chapters + questions left by\nany earlier attempt (retry starts over, D13)
+    api -> db : job → PROCESSING, editionId
+    api ->> runner : process(jobId)  [not awaited]
+    api --> spa : 202 {editionId}
+    spa --> up : book page (work in progress)
+  end
+  deactivate api
+end
+
+== 4. Book page while processing — any signed-in user (D15, P6) ==
+spa -> api : GET /api/editions/{editionId}
+api --> spa : {status: PROCESSING, activeJobId, progress}\n(no questions until READY, D16)
+spa -> api : GET /api/ingestion-jobs/{jobId}/events  (SSE)
+api -> bus : subscribe(jobId)
+
+== 5. Processing (inside the Express process, D12) ==
+activate runner
+runner -> disk : read PDF
+runner -> gem : generateContent(whole PDF,\n"list chapters with page ranges → JSON")
+gem --> runner : chapters
+runner -> db : insert Chapters; progress.chaptersTotal
+runner -> bus : publish(progress)
+bus --> spa : event: progress
+
+loop each chapter, one at a time (P7)
+  runner -> db : refresh heartbeat — only if lock.jobId = this job (P4);\nif it isn't, stop: see "lock lost" below
+  runner -> runner : cut out the chapter's pages
+  runner -> gem : generateContent(chapter pages + instructions\n+ list of supported runtimes)
+  note right of gem
+    For each exercise: code or abstract; language + version;
+    statement word for word; signature; starter code;
+    harness (D23, P9); 2–3 visible + hidden tests (D24);
+    "order doesn't matter" flag (D26).
+  end note
+  opt per-minute rate limit (HTTP 429)
+    runner -> runner : wait, then resend the same request
+  end
+  gem --> runner : exercises (JSON)
+  runner -> runner : discard: abstract (D20); language not supported (D21);\npinned version not supported (D22); malformed (P7).\nNo pinned version → latest supported (A5)
+  runner -> db : insert Questions (hidden until the edition is READY)
+  runner -> db : update job progress
+  runner -> bus : publish(progress)
+  bus --> spa : event: progress (e.g. chapter 4 of 12, 37 questions)
+end
+
+alt every chapter processed
+  runner -> db : Edition → READY, readyAt; remove lock
+  runner -> db : job → SUCCEEDED
+  runner -> disk : delete PDF (D10)
+  runner -> bus : publish(completed)
+  bus --> spa : event: completed
+  spa -> api : GET /api/editions/{editionId}
+  api --> spa : chapters + questions
+  spa --> up : questions can now be opened
+else lock lost (another upload claimed the edition after 10 min without a heartbeat)
+  runner -> db : job → FAILED ("lock lost")
+  runner -> disk : delete PDF
+  note right of runner
+    Leaves the edition alone:
+    it now belongs to the other job.
+  end note
+else daily quota used up, repeated unparseable output, or any other error (P5, P7)
+  runner -> db : delete this edition's chapters + questions
+  runner -> db : Edition → FAILED (reason); remove lock
+  runner -> db : job → FAILED
+  runner -> disk : delete PDF
+  runner -> bus : publish(failed)
+  bus --> spa : event: failed
+  spa --> up : "Processing failed — upload the PDF again to retry"
+end
+deactivate runner
+
+== Housekeeping (Start-up & sweeper tasks) ==
+group every few minutes
+  api -> db : jobs AWAITING_APPROVAL past their deadline → EXPIRED (D9)
+  api -> disk : delete their PDFs
+end
+group when the API starts (P4)
+  api -> db : jobs still PROCESSING → FAILED;\ntheir editions → FAILED, chapters + questions deleted
+  api -> disk : delete their PDFs
+end
+
+@enduml
