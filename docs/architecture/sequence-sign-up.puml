@@ -1,0 +1,47 @@
+@startuml sequence-sign-up
+' BookCode — sign up.
+' IDs like (D1) or (P1) refer to the decision log in docs/architecture/README.md.
+
+title Sign up
+
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+autonumber
+
+actor "Visitor" as v
+participant "React SPA" as spa
+participant "Express API\n(AuthService)" as api
+database "MongoDB" as db
+
+v -> spa : open sign-up page,\nenter email + password
+spa -> spa : client-side checks\n(password rules: O7)
+spa -> api : POST /api/auth/signup\n{email, password}
+activate api
+api -> api : validate input
+api -> db : find User by email
+alt email already registered
+  db --> api : user
+  api --> spa : 409 Conflict
+  spa --> v : "An account with this email already exists"
+else new email
+  db --> api : none
+  api -> api : hash password\n(salted, deliberately slow hash)
+  api -> db : insert User {email, passwordHash, role: USER}
+  note right
+    role is always USER (D1).
+    The unique index on email also
+    catches two sign-ups racing (→ 409).
+  end note
+  db --> api : userId
+  group P1 — sign the new user straight in
+    api -> api : generate session id
+    api -> db : insert Session {userId, expiresAt}
+    api --> spa : 201 Created {id, email, role}\nSet-Cookie: sid=…; HttpOnly; Secure; SameSite=Lax  (D4, P16)
+  end
+  spa -> spa : keep the user in app state
+  spa --> v : catalogue page
+end
+deactivate api
+
+@enduml

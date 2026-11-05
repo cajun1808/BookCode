@@ -1,0 +1,316 @@
+@startuml class-diagram
+' BookCode — class diagram (domain model).
+' IDs like (D7) or (P13) refer to the decision log in docs/architecture/README.md.
+' <<embedded>> = stored inside its parent's MongoDB document, not as its own collection.
+
+title BookCode — class diagram (domain model)
+
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam nodesep 40
+skinparam ranksep 50
+hide empty members
+
+package "Users & sessions" {
+  class User {
+    id : ObjectId
+    email : string {unique}
+    passwordHash : string
+    role : Role
+    createdAt : Date
+  }
+  note bottom of User
+    Sign-up always creates a USER (D1).
+    The ADMIN account is created at start-up
+    from environment variables (D2).
+  end note
+
+  class Session {
+    id : string
+    userId : ObjectId
+    expiresAt : Date
+  }
+
+  enum Role {
+    USER
+    ADMIN
+  }
+}
+
+package "Catalogue" {
+  class Book {
+    id : ObjectId
+    mainTitle : string
+    authors : string[]
+    matchKey : string {unique}
+    createdAt : Date
+  }
+  note right of Book
+    mainTitle = text before the first colon.
+    matchKey = normalised main title +
+    sorted author surnames (D7).
+  end note
+
+  class Edition {
+    id : ObjectId
+    bookId : ObjectId
+    editionNumber : int
+    fullTitle : string
+    status : EditionStatus
+    lock : EditionLock [0..1]
+    failureReason : string [0..1]
+    uploadedBy : ObjectId
+    createdAt : Date
+    readyAt : Date [0..1]
+  }
+  note right of Edition
+    Unique on (bookId, editionNumber).
+    editionNumber = 1 when the book states none (D7).
+    Questions are usable only when READY (D16).
+  end note
+
+  class EditionLock <<embedded>> {
+    jobId : ObjectId
+    heartbeatAt : Date
+  }
+  note right of EditionLock
+    Expired after 10 min without
+    a heartbeat (D13, P4).
+  end note
+
+  enum EditionStatus {
+    PROCESSING
+    READY
+    FAILED
+  }
+
+  class Chapter {
+    id : ObjectId
+    editionId : ObjectId
+    number : string
+    title : string
+    position : int
+  }
+
+  class Question {
+    id : ObjectId
+    editionId : ObjectId
+    chapterId : ObjectId
+    exerciseLabel : string
+    position : int
+    statement : string
+    language : Language
+    languageVersion : string
+    signature : string
+    starterCode : string
+    harnessCode : string
+    orderInsensitive : boolean
+    testCases : TestCase[]
+    source : QuestionSource
+    createdBy : ObjectId [0..1]
+    createdAt : Date
+    updatedAt : Date
+  }
+  note right of Question
+    statement is stored word for word (D10).
+    harnessCode is written by the AI (D23),
+    or by an admin for ADMIN questions (P12).
+    orderInsensitive is set by the AI,
+    editable by admins (D26).
+  end note
+
+  class TestCase <<embedded>> {
+    id : ObjectId
+    position : int
+    arguments : TypedValue[]
+    expected : TypedValue
+    visible : boolean
+  }
+  note right of TestCase
+    2–3 visible per question,
+    the rest hidden (D24).
+  end note
+
+  class TypedValue <<value object>> {
+    type : string
+    value : JSON
+  }
+  note right of TypedValue
+    Keeps 4 vs 4.0 distinct (D25).
+    Exact encoding: O5.
+  end note
+
+  enum Language {
+    PYTHON
+    JAVASCRIPT
+    JAVA
+  }
+
+  enum QuestionSource {
+    AI
+    ADMIN
+  }
+}
+
+package "Progress & reports" {
+  class Completion {
+    id : ObjectId
+    userId : ObjectId
+    questionId : ObjectId
+    completedAt : Date
+  }
+  note bottom of Completion
+    Unique on (userId, questionId).
+    Stays set if the tests change later (A6).
+  end note
+
+  class Report {
+    id : ObjectId
+    questionId : ObjectId
+    testCaseId : ObjectId [0..1]
+    reporterId : ObjectId
+    category : ReportCategory
+    description : string
+    status : ReportStatus
+    resolvedBy : ObjectId [0..1]
+    resolvedAt : Date [0..1]
+    resolutionNote : string [0..1]
+    createdAt : Date
+  }
+
+  enum ReportCategory {
+    WRONG_TEST_CASE
+    WRONG_STATEMENT
+    BROKEN_HARNESS
+    OTHER
+  }
+
+  enum ReportStatus {
+    OPEN
+    RESOLVED
+    DISMISSED
+  }
+}
+
+package "Ingestion" {
+  class IngestionJob {
+    id : ObjectId
+    uploaderId : ObjectId
+    status : JobStatus
+    pdfPath : string [0..1]
+    detected : BookMetadata [0..1]
+    approved : BookMetadata [0..1]
+    editionId : ObjectId [0..1]
+    progress : JobProgress
+    reason : string [0..1]
+    createdAt : Date
+    approvalDeadline : Date
+    finishedAt : Date [0..1]
+  }
+  note right of IngestionJob
+    approvalDeadline = createdAt + 24 h (D9).
+    pdfPath is cleared once the PDF is deleted (D10).
+    reason explains FAILED / REJECTED.
+  end note
+
+  class BookMetadata <<embedded>> {
+    mainTitle : string
+    fullTitle : string
+    authors : string[]
+    editionNumber : int
+  }
+
+  class JobProgress <<embedded>> {
+    chaptersTotal : int
+    chaptersDone : int
+    questionsKept : int
+    discardedAbstract : int
+    discardedUnsupported : int
+    discardedMalformed : int
+  }
+
+  enum JobStatus {
+    DETECTING
+    AWAITING_APPROVAL
+    PROCESSING
+    SUCCEEDED
+    FAILED
+    REJECTED
+    CANCELLED
+    EXPIRED
+  }
+}
+
+package "Configuration (not stored)" {
+  class SupportedRuntime {
+    language : Language
+    version : string
+    judge0LanguageId : int
+  }
+  note bottom of SupportedRuntime
+    One entry per runtime in our custom Judge0 image (D30).
+    "Latest" = highest version per language (A5).
+    A question whose language + version has no entry
+    is discarded (D21, D22).
+  end note
+}
+
+package "Per Run (not stored)" {
+  class RunResult {
+    outcome : RunOutcome
+    failedTest : FailedTest [0..1]
+    stdout : string
+    stderr : string
+    compileOutput : string [0..1]
+    timeMs : int
+    memoryKb : int
+  }
+
+  class FailedTest {
+    position : int
+    visible : boolean
+    arguments : TypedValue[]
+    expected : TypedValue
+    actual : TypedValue [0..1]
+    error : string [0..1]
+  }
+  note bottom of FailedTest
+    Only the first failing test is returned,
+    even if it is hidden (D24, D28).
+  end note
+
+  enum RunOutcome {
+    PASSED
+    WRONG_ANSWER
+    RUNTIME_ERROR
+    TIME_LIMIT_EXCEEDED
+    COMPILATION_ERROR
+    RUNNER_UNAVAILABLE
+  }
+}
+
+' --- relationships
+User "1" -- "0..*" Session : has >
+User "1" -- "0..*" IngestionJob : uploads >
+User "1" -- "0..*" Completion : earns >
+User "1" -- "0..*" Report : files >
+
+Book "1" *-- "1..*" Edition : editions >
+Edition "1" *-- "0..1" EditionLock
+Edition "1" *-- "0..*" Chapter : chapters >
+Chapter "1" *-- "0..*" Question : questions >
+Question "1" *-- "1..*" TestCase : testCases >
+TestCase "1" *-- "1..*" TypedValue
+
+Question "1" -- "0..*" Completion
+Question "1" -- "0..*" Report : about <
+Report "0..*" --> "0..1" TestCase : points at >
+
+IngestionJob "0..*" --> "0..1" Edition : processes >
+IngestionJob *-- "0..2" BookMetadata
+IngestionJob *-- "1" JobProgress
+
+Question ..> SupportedRuntime : language + version\nmust match one >
+RunResult *-- "0..1" FailedTest
+
+@enduml
